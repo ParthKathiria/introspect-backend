@@ -415,6 +415,13 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
 export async function handleSummary(request: Request, env: any, corsHeaders: any) {
   const body = await request.json();
   
+  // New format: array of analysis objects
+  // body = [
+  //   { analysis: "Steady breathing indicates relaxation.", expression: "calm", timestamp: 1.0 },
+  //   { analysis: "Heart rate slightly elevated, stay engaged.", expression: "neutral", timestamp: 3.5 },
+  //   ...
+  // ]
+  
   if (!Array.isArray(body) || body.length === 0) {
     return new Response(JSON.stringify({ 
       summary: "No data was collected during this session." 
@@ -423,78 +430,102 @@ export async function handleSummary(request: Request, env: any, corsHeaders: any
     });
   }
   
-  // Build summary of session
-  const eventsSummary = body.map((metric: any, i: number) => {
-    const hr = metric.Pulse || 'N/A';
-    const br = metric.Breath || 'N/A';
-    const time = metric.Time?.toFixed(2) || 'N/A';
-    return `Time ${time}s: HR ${hr}bpm, BR ${br}/min`;
+  console.log(`Generating summary for ${body.length} insights...`);
+  
+  // Build summary from stored analyses
+  const insightsSummary = body.map((item: any, i: number) => {
+    const time = item.timestamp?.toFixed(1) || 'N/A';
+    const expression = item.expression || 'unknown';
+    const analysis = item.analysis || 'No insight';
+    return `[${time}s - ${expression}]: ${analysis}`;
   }).join('\n');
   
-  // Calculate statistics
-  const avgHeartRate = body.reduce((sum: number, m: any) => sum + (m.Pulse || 0), 0) / body.length;
-  const maxHeartRate = Math.max(...body.map((m: any) => m.Pulse || 0));
-  const minHeartRate = Math.min(...body.map((m: any) => m.Pulse || 0));
+  // Calculate session statistics
+  const sessionDuration = body[body.length - 1].timestamp || 0;
+  const expressionCounts: Record<string, number> = {};
   
-  const summaryPrompt = `You are a compassionate conversation analyst helping neurodivergent individuals. 
-A person just completed a conversation where their biometric data was tracked. Here are the readings:
-
-${eventsSummary}
-
-Statistics:
-- Session duration: ${body.length} data points collected over ${body[body.length - 1].Time.toFixed(0)} seconds
-- Average heart rate: ${avgHeartRate.toFixed(1)} bpm
-- Heart rate range: ${minHeartRate}-${maxHeartRate} bpm
-
-Provide a supportive 3-4 sentence summary that includes:
-1. Overall patterns observed during the conversation (e.g., stable, fluctuating, trending up/down)
-2. Any notable moments where metrics changed significantly
-3. One constructive suggestion for navigating similar conversations in the future
-
-Be kind, encouraging, and practical.`;
-
-  const geminiResponse = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${env.GEMINI_API_KEY}`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        contents: [{
-          parts: [{ text: summaryPrompt }]
-        }],
-        generationConfig: {
-          temperature: 0.8,
-          maxOutputTokens: 300
-        }
-      })
-    }
-  );
-  
-  if (!geminiResponse.ok) {
-    const errorText = await geminiResponse.text();
-    throw new Error(`Gemini API error: ${geminiResponse.statusText} - ${errorText}`);
-  }
-  
-  const geminiData: any = await geminiResponse.json();
-  
-  if (!geminiData.candidates || !geminiData.candidates[0]?.content?.parts?.[0]?.text) {
-    throw new Error('Invalid response from Gemini API');
-  }
-  
-  const summary = geminiData.candidates[0].content.parts[0].text;
-  
-  return new Response(JSON.stringify({ 
-    summary,
-    eventCount: body.length,
-    duration: body[body.length - 1].Time,
-    statistics: {
-      avgHeartRate: avgHeartRate.toFixed(1),
-      maxHeartRate,
-      minHeartRate
-    }
-  }), {
-    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+  // Count expressions
+  body.forEach((item: any) => {
+    const expr = item.expression || 'unknown';
+    expressionCounts[expr] = (expressionCounts[expr] || 0) + 1;
   });
+  
+  // Find most common expression
+  const mostCommonExpression = Object.entries(expressionCounts)
+    .sort((a, b) => b[1] - a[1])[0];
+  
+  const summaryPrompt = `You are a compassionate conversation analyst helping neurodivergent individuals or therapists understand the emotional state of the person they were talking to.
+
+During a conversation, the following real-time emotional insights were observed about the OTHER PERSON (the person being monitored):
+
+${insightsSummary}
+
+Session Statistics:
+- Total insights: ${body.length}
+- Session duration: ${sessionDuration.toFixed(1)} seconds
+- Most common emotion: ${mostCommonExpression[0]} (appeared ${mostCommonExpression[1]} times)
+- Emotion distribution: ${Object.entries(expressionCounts).map(([e, c]) => `${e}: ${c}`).join(', ')}
+
+Provide a supportive summary (3-4 sentences) using THIRD-PERSON perspective (they/them/their) that includes:
+1. The other person's overall emotional journey during the conversation (patterns, transitions)
+2. Key moments or turning points in their emotional state
+3. One practical suggestion for how to approach similar emotional patterns with this person in future conversations
+
+Write about "the person," "they," or "them" - NOT "you" or "your". Focus on observing and understanding their emotional patterns.`;
+
+  try {
+    const geminiResponse = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${env.GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          contents: [{
+            parts: [{ text: summaryPrompt }]
+          }],
+          generationConfig: {
+            temperature: 0.8,
+            maxOutputTokens: 400
+          }
+        })
+      }
+    );
+    
+    if (!geminiResponse.ok) {
+      const errorText = await geminiResponse.text();
+      throw new Error(`Gemini API error: ${geminiResponse.statusText} - ${errorText}`);
+    }
+    
+    const geminiData: any = await geminiResponse.json();
+    
+    if (!geminiData.candidates || !geminiData.candidates[0]?.content?.parts?.[0]?.text) {
+      throw new Error('Invalid response from Gemini API');
+    }
+    
+    const summary = geminiData.candidates[0].content.parts[0].text;
+    
+    return new Response(JSON.stringify({ 
+      summary,
+      sessionStats: {
+        totalInsights: body.length,
+        duration: sessionDuration.toFixed(1),
+        mostCommonEmotion: mostCommonExpression[0],
+        emotionDistribution: expressionCounts
+      }
+    }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+    
+  } catch (error) {
+    console.error('Error in handleSummary:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return new Response(JSON.stringify({ 
+      error: errorMessage
+    }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    });
+  }
 }
